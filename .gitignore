@@ -2,3 +2,4 @@ build/
 *.o
 *.out
 *.exe
+results/*.ppm

@@ -7,6 +7,9 @@
 #include <iomanip>
 #include <iostream>
 #include <vector>
+#include <fstream>
+#include <string>
+
 
 #define CHECK_CUDA(call)                                                        \
     do {                                                                        \
@@ -145,6 +148,52 @@ double maxAbsError(const std::vector<float>& a, const std::vector<float>& b) {
 
     return maxError;
 }
+float clamp01(float x) {
+    if (x < 0.0f) {
+        return 0.0f;
+    }
+    if (x > 1.0f) {
+        return 1.0f;
+    }
+    return x;
+}
+
+void writePPM(const std::vector<float>& grid, int n, const std::string& filename) {
+    std::ofstream out(filename);
+
+    if (!out) {
+        std::cerr << "Failed to open output file: " << filename << std::endl;
+        return;
+    }
+
+    // P3 = ASCII PPM
+    out << "P3\n";
+    out << n << " " << n << "\n";
+    out << 255 << "\n";
+
+    // We know the hot boundary is 100 and cold is 0,
+    // so scale temperatures from [0,100] to [0,1].
+    for (int row = 0; row < n; ++row) {
+        for (int col = 0; col < n; ++col) {
+            float temp = grid[row * n + col];
+            float t = clamp01(temp / 100.0f);
+
+            // Gamma adjustment makes low temperatures easier to see.
+            // This is only for visualization, not for correctness.
+            t = std::pow(t, 0.35f);
+
+            // Blue -> cyan/green -> yellow/red heatmap
+            int r = static_cast<int>(255.0f * clamp01(1.5f * t - 0.3f));
+            int g = static_cast<int>(255.0f * clamp01(1.5f - std::fabs(3.0f * t - 1.5f)));
+            int b = static_cast<int>(255.0f * clamp01(1.0f - 1.5f * t));
+
+            out << r << " " << g << " " << b << " ";
+        }
+        out << "\n";
+    }
+
+    out.close();
+}
 
 int main(int argc, char** argv) {
     int n = 512;
@@ -182,6 +231,8 @@ int main(int argc, char** argv) {
         gpuKernelMs,
         gpuTotalMs
     );
+    std::string ppmFilename = "results/heat_" + std::to_string(n) + ".ppm";
+    writePPM(gpuOutput, n, ppmFilename);
 
     double error = maxAbsError(cpuOutput, gpuOutput);
     bool passed = error < 1e-3;
@@ -204,7 +255,7 @@ int main(int argc, char** argv) {
     std::cout << "GPU speedup using total time: " << cpuMs / gpuTotalMs << "x" << std::endl;
     std::cout << "Estimated GPU GFLOP/s: " << estimatedGflops << std::endl;
     std::cout << "Estimated GPU bandwidth: " << estimatedBandwidth << " GB/s" << std::endl;
-
+    std::cout << "Wrote visualization to: " << ppmFilename << std::endl;
     std::cout << "CSV,"
               << n << ","
               << iterations << ","
