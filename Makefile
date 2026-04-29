@@ -9,16 +9,18 @@ NVCCFLAGS := -O3 -std=c++17 -m64 -lineinfo
 all: $(TARGET)
 
 $(TARGET): $(SRC)
->mkdir -p build
->$(NVCC) $(NVCCFLAGS) $(SRC) -o $(TARGET)
+>@mkdir -p build
+>@$(NVCC) $(NVCCFLAGS) $(SRC) -o $(TARGET)
 
 run: all
->./$(TARGET) 512 500
+>@mkdir -p results
+>@./$(TARGET) 256 5000 all results/heat_256.ppm
 
 bench: all
->./scripts/run_benchmarks.sh
+>@mkdir -p results
+>@./scripts/run_benchmarks.sh
 
 clean:
->rm -rf build
+>@rm -rf build
 
 .PHONY: all run bench clean

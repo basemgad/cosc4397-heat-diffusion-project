@@ -4,12 +4,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <vector>
-#include <fstream>
 #include <string>
-
+#include <vector>
 
 #define CHECK_CUDA(call)                                                        \
     do {                                                                        \
@@ -21,7 +20,16 @@
         }                                                                       \
     } while (0)
 
-__global__ void jacobiKernel(const float* current, float* next, int n) {
+struct GpuResult {
+    std::string name;
+    std::vector<float> output;
+    double kernelMs;
+    double totalMs;
+    int blockX;
+    int blockY;
+};
+
+__global__ void jacobiGlobalKernel(const float* current, float* next, int n) {
     int col = blockIdx.x * blockDim.x + threadIdx.x + 1;
     int row = blockIdx.y * blockDim.y + threadIdx.y + 1;
 
@@ -39,15 +47,58 @@ __global__ void jacobiKernel(const float* current, float* next, int n) {
     );
 }
 
+__global__ void jacobiSharedKernel(const float* current, float* next, int n) {
+    extern __shared__ float tile[];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int sharedWidth = blockDim.x + 2;
+    int sharedHeight = blockDim.y + 2;
+
+    int blockStartCol = blockIdx.x * blockDim.x;
+    int blockStartRow = blockIdx.y * blockDim.y;
+
+    for (int sy = ty; sy < sharedHeight; sy += blockDim.y) {
+        for (int sx = tx; sx < sharedWidth; sx += blockDim.x) {
+            int globalRow = blockStartRow + sy;
+            int globalCol = blockStartCol + sx;
+
+            if (globalRow >= 0 && globalRow < n && globalCol >= 0 && globalCol < n) {
+                tile[sy * sharedWidth + sx] = current[globalRow * n + globalCol];
+            } else {
+                tile[sy * sharedWidth + sx] = 0.0f;
+            }
+        }
+    }
+
+    __syncthreads();
+
+    int col = blockStartCol + tx + 1;
+    int row = blockStartRow + ty + 1;
+
+    if (row >= n - 1 || col >= n - 1) {
+        return;
+    }
+
+    int sharedRow = ty + 1;
+    int sharedCol = tx + 1;
+
+    float top = tile[(sharedRow - 1) * sharedWidth + sharedCol];
+    float bottom = tile[(sharedRow + 1) * sharedWidth + sharedCol];
+    float left = tile[sharedRow * sharedWidth + (sharedCol - 1)];
+    float right = tile[sharedRow * sharedWidth + (sharedCol + 1)];
+
+    next[row * n + col] = 0.25f * (top + bottom + left + right);
+}
+
 void initializeGrid(std::vector<float>& grid, int n) {
     std::fill(grid.begin(), grid.end(), 0.0f);
 
-    // Hot top boundary.
     for (int col = 0; col < n; ++col) {
         grid[col] = 100.0f;
     }
 
-    // Cold left and right boundaries.
     for (int row = 0; row < n; ++row) {
         grid[row * n] = 0.0f;
         grid[row * n + (n - 1)] = 0.0f;
@@ -78,12 +129,13 @@ std::vector<float> runCpuJacobi(const std::vector<float>& initial, int n, int it
     return current;
 }
 
-std::vector<float> runGpuJacobi(
+GpuResult runGpuGlobal(
     const std::vector<float>& initial,
     int n,
     int iterations,
-    float& kernelMs,
-    double& totalMs
+    int blockX,
+    int blockY,
+    const std::string& name
 ) {
     size_t bytes = static_cast<size_t>(n) * n * sizeof(float);
 
@@ -98,7 +150,7 @@ std::vector<float> runGpuJacobi(
     CHECK_CUDA(cudaMemcpy(dCurrent, initial.data(), bytes, cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(dNext, initial.data(), bytes, cudaMemcpyHostToDevice));
 
-    dim3 block(16, 16);
+    dim3 block(blockX, blockY);
     dim3 grid(
         (n - 2 + block.x - 1) / block.x,
         (n - 2 + block.y - 1) / block.y
@@ -113,7 +165,7 @@ std::vector<float> runGpuJacobi(
     CHECK_CUDA(cudaEventRecord(startEvent));
 
     for (int iter = 0; iter < iterations; ++iter) {
-        jacobiKernel<<<grid, block>>>(dCurrent, dNext, n);
+        jacobiGlobalKernel<<<grid, block>>>(dCurrent, dNext, n);
         CHECK_CUDA(cudaGetLastError());
         std::swap(dCurrent, dNext);
     }
@@ -121,6 +173,7 @@ std::vector<float> runGpuJacobi(
     CHECK_CUDA(cudaEventRecord(stopEvent));
     CHECK_CUDA(cudaEventSynchronize(stopEvent));
 
+    float kernelMs = 0.0f;
     CHECK_CUDA(cudaEventElapsedTime(&kernelMs, startEvent, stopEvent));
 
     std::vector<float> output(static_cast<size_t>(n) * n);
@@ -133,9 +186,73 @@ std::vector<float> runGpuJacobi(
     CHECK_CUDA(cudaFree(dNext));
 
     auto totalEnd = std::chrono::high_resolution_clock::now();
-    totalMs = std::chrono::duration<double, std::milli>(totalEnd - totalStart).count();
+    double totalMs = std::chrono::duration<double, std::milli>(totalEnd - totalStart).count();
 
-    return output;
+    return {name, output, static_cast<double>(kernelMs), totalMs, blockX, blockY};
+}
+
+GpuResult runGpuShared(
+    const std::vector<float>& initial,
+    int n,
+    int iterations,
+    int blockX,
+    int blockY,
+    const std::string& name
+) {
+    size_t bytes = static_cast<size_t>(n) * n * sizeof(float);
+
+    auto totalStart = std::chrono::high_resolution_clock::now();
+
+    float* dCurrent = nullptr;
+    float* dNext = nullptr;
+
+    CHECK_CUDA(cudaMalloc(&dCurrent, bytes));
+    CHECK_CUDA(cudaMalloc(&dNext, bytes));
+
+    CHECK_CUDA(cudaMemcpy(dCurrent, initial.data(), bytes, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(dNext, initial.data(), bytes, cudaMemcpyHostToDevice));
+
+    dim3 block(blockX, blockY);
+    dim3 grid(
+        (n - 2 + block.x - 1) / block.x,
+        (n - 2 + block.y - 1) / block.y
+    );
+
+    size_t sharedBytes = static_cast<size_t>(blockX + 2) * (blockY + 2) * sizeof(float);
+
+    cudaEvent_t startEvent;
+    cudaEvent_t stopEvent;
+
+    CHECK_CUDA(cudaEventCreate(&startEvent));
+    CHECK_CUDA(cudaEventCreate(&stopEvent));
+
+    CHECK_CUDA(cudaEventRecord(startEvent));
+
+    for (int iter = 0; iter < iterations; ++iter) {
+        jacobiSharedKernel<<<grid, block, sharedBytes>>>(dCurrent, dNext, n);
+        CHECK_CUDA(cudaGetLastError());
+        std::swap(dCurrent, dNext);
+    }
+
+    CHECK_CUDA(cudaEventRecord(stopEvent));
+    CHECK_CUDA(cudaEventSynchronize(stopEvent));
+
+    float kernelMs = 0.0f;
+    CHECK_CUDA(cudaEventElapsedTime(&kernelMs, startEvent, stopEvent));
+
+    std::vector<float> output(static_cast<size_t>(n) * n);
+    CHECK_CUDA(cudaMemcpy(output.data(), dCurrent, bytes, cudaMemcpyDeviceToHost));
+
+    CHECK_CUDA(cudaEventDestroy(startEvent));
+    CHECK_CUDA(cudaEventDestroy(stopEvent));
+
+    CHECK_CUDA(cudaFree(dCurrent));
+    CHECK_CUDA(cudaFree(dNext));
+
+    auto totalEnd = std::chrono::high_resolution_clock::now();
+    double totalMs = std::chrono::duration<double, std::milli>(totalEnd - totalStart).count();
+
+    return {name, output, static_cast<double>(kernelMs), totalMs, blockX, blockY};
 }
 
 double maxAbsError(const std::vector<float>& a, const std::vector<float>& b) {
@@ -148,13 +265,16 @@ double maxAbsError(const std::vector<float>& a, const std::vector<float>& b) {
 
     return maxError;
 }
+
 float clamp01(float x) {
     if (x < 0.0f) {
         return 0.0f;
     }
+
     if (x > 1.0f) {
         return 1.0f;
     }
+
     return x;
 }
 
@@ -166,39 +286,182 @@ void writePPM(const std::vector<float>& grid, int n, const std::string& filename
         return;
     }
 
-    // P3 = ASCII PPM
     out << "P3\n";
     out << n << " " << n << "\n";
     out << 255 << "\n";
 
-    // We know the hot boundary is 100 and cold is 0,
-    // so scale temperatures from [0,100] to [0,1].
     for (int row = 0; row < n; ++row) {
         for (int col = 0; col < n; ++col) {
             float temp = grid[row * n + col];
             float t = clamp01(temp / 100.0f);
 
-            // Gamma adjustment makes low temperatures easier to see.
-            // This is only for visualization, not for correctness.
             t = std::pow(t, 0.35f);
 
-            // Blue -> cyan/green -> yellow/red heatmap
             int r = static_cast<int>(255.0f * clamp01(1.5f * t - 0.3f));
             int g = static_cast<int>(255.0f * clamp01(1.5f - std::fabs(3.0f * t - 1.5f)));
             int b = static_cast<int>(255.0f * clamp01(1.0f - 1.5f * t));
 
             out << r << " " << g << " " << b << " ";
         }
+
         out << "\n";
     }
+}
 
-    out.close();
+void printGpuResult(
+    const GpuResult& result,
+    double cpuMs,
+    const std::vector<float>& cpuOutput,
+    int n,
+    int iterations
+) {
+    double error = maxAbsError(cpuOutput, result.output);
+    bool passed = error < 1e-3;
+
+    double updates = static_cast<double>(n - 2) * static_cast<double>(n - 2) * iterations;
+    double kernelSeconds = result.kernelMs / 1000.0;
+
+    double gflops = (updates * 4.0) / (kernelSeconds * 1e9);
+    double bandwidth = (updates * 20.0) / (kernelSeconds * 1e9);
+
+    double speedupKernel = cpuMs / result.kernelMs;
+    double speedupTotal = cpuMs / result.totalMs;
+
+    std::cout << std::fixed << std::setprecision(4);
+
+    std::cout << "Variant: " << result.name << std::endl;
+    std::cout << "Block size: " << result.blockX << " x " << result.blockY << std::endl;
+    std::cout << "CPU time: " << cpuMs << " ms" << std::endl;
+    std::cout << "GPU kernel time: " << result.kernelMs << " ms" << std::endl;
+    std::cout << "GPU total time: " << result.totalMs << " ms" << std::endl;
+    std::cout << "Max absolute error: " << error << std::endl;
+    std::cout << "Validation: " << (passed ? "PASS" : "FAIL") << std::endl;
+    std::cout << "GPU speedup using kernel time: " << speedupKernel << "x" << std::endl;
+    std::cout << "GPU speedup using total time: " << speedupTotal << "x" << std::endl;
+    std::cout << "Estimated GPU GFLOP/s: " << gflops << std::endl;
+    std::cout << "Estimated GPU bandwidth: " << bandwidth << " GB/s" << std::endl;
+
+    std::cout << "CSV,"
+              << result.name << ","
+              << n << ","
+              << iterations << ","
+              << result.blockX << ","
+              << result.blockY << ","
+              << cpuMs << ","
+              << result.kernelMs << ","
+              << result.totalMs << ","
+              << error << ","
+              << (passed ? "PASS" : "FAIL") << ","
+              << speedupKernel << ","
+              << speedupTotal << ","
+              << gflops << ","
+              << bandwidth
+              << std::endl;
+}
+void printCsvLine(
+    const GpuResult& result,
+    double cpuMs,
+    const std::vector<float>& cpuOutput,
+    int n,
+    int iterations
+) {
+    double error = maxAbsError(cpuOutput, result.output);
+    bool passed = error < 1e-3;
+
+    double updates = static_cast<double>(n - 2) * static_cast<double>(n - 2) * iterations;
+    double kernelSeconds = result.kernelMs / 1000.0;
+    double gflops = (updates * 4.0) / (kernelSeconds * 1e9);
+    double bandwidth = (updates * 20.0) / (kernelSeconds * 1e9);
+
+    std::cout << "CSV,"
+              << result.name << ","
+              << n << ","
+              << iterations << ","
+              << result.blockX << ","
+              << result.blockY << ","
+              << cpuMs << ","
+              << result.kernelMs << ","
+              << result.totalMs << ","
+              << error << ","
+              << (passed ? "PASS" : "FAIL") << ","
+              << cpuMs / result.kernelMs << ","
+              << cpuMs / result.totalMs << ","
+              << gflops << ","
+              << bandwidth
+              << std::endl;
+}
+
+void runAllVariants(
+    const std::vector<float>& initial,
+    const std::vector<float>& cpuOutput,
+    double cpuMs,
+    int n,
+    int iterations,
+    const std::string& ppmFilename,
+    bool csvOutput
+) {
+    std::vector<GpuResult> results;
+
+    results.push_back(runGpuGlobal(initial, n, iterations, 32, 8, "global_32x8"));
+    results.push_back(runGpuShared(initial, n, iterations, 32, 8, "shared_32x8"));
+
+    std::cout << std::fixed << std::setprecision(4);
+
+    std::cout << "Heat Diffusion Jacobi Stencil\n";
+    std::cout << "Grid: " << n << " x " << n << "\n";
+    std::cout << "Iterations: " << iterations << "\n";
+    std::cout << "CPU reference time: " << cpuMs << " ms\n\n";
+
+    std::cout << std::left
+              << std::setw(16) << "Variant"
+              << std::setw(13) << "Kernel ms"
+              << std::setw(13) << "Total ms"
+              << std::setw(10) << "Speedup"
+              << std::setw(11) << "Error"
+              << "Result\n";
+
+    std::cout << std::string(70, '-') << "\n";
+
+    const GpuResult* best = &results[0];
+
+    for (const GpuResult& result : results) {
+        double error = maxAbsError(cpuOutput, result.output);
+        bool passed = error < 1e-3;
+        double speedup = cpuMs / result.kernelMs;
+
+        std::cout << std::left
+                  << std::setw(16) << result.name
+                  << std::setw(13) << result.kernelMs
+                  << std::setw(13) << result.totalMs
+                  << std::setw(10) << speedup
+                  << std::setw(11) << error
+                  << (passed ? "PASS" : "FAIL")
+                  << "\n";
+
+        if (result.kernelMs < best->kernelMs) {
+            best = &result;
+        }
+
+        if (csvOutput) {
+            printCsvLine(result, cpuMs, cpuOutput, n, iterations);
+        }
+    }
+
+    std::cout << "\nBest variant: " << best->name << "\n";
+    std::cout << "Best kernel time: " << best->kernelMs << " ms\n";
+
+    if (!ppmFilename.empty()) {
+        writePPM(best->output, n, ppmFilename);
+        std::cout << "Visualization: " << ppmFilename << "\n";
+    }
 }
 
 int main(int argc, char** argv) {
-    int n = 512;
-    int iterations = 500;
-
+    int n = 256;
+    int iterations = 2000;
+    std::string mode = "all";
+    std::string ppmFilename = "results/heat.ppm";
+    bool csvOutput = false;
     if (argc >= 2) {
         n = std::atoi(argv[1]);
     }
@@ -207,10 +470,29 @@ int main(int argc, char** argv) {
         iterations = std::atoi(argv[2]);
     }
 
+    if (argc >= 4) {
+        mode = argv[3];
+    }
+
+    if (argc >= 5) {
+        ppmFilename = argv[4];
+    }
+
+    if (argc >= 6) {
+    csvOutput = std::string(argv[5]) == "csv";
+}
+
     if (n < 3) {
         std::cerr << "Grid size must be at least 3." << std::endl;
         return 1;
     }
+
+    if (iterations < 0) {
+        std::cerr << "Iterations cannot be negative." << std::endl;
+        return 1;
+    }
+
+    CHECK_CUDA(cudaFree(0));
 
     std::vector<float> initial(static_cast<size_t>(n) * n);
     initializeGrid(initial, n);
@@ -221,54 +503,50 @@ int main(int argc, char** argv) {
 
     double cpuMs = std::chrono::duration<double, std::milli>(cpuEnd - cpuStart).count();
 
-    float gpuKernelMs = 0.0f;
-    double gpuTotalMs = 0.0;
+    if (mode == "cpu") {
+        std::cout << "Grid size: " << n << " x " << n << std::endl;
+        std::cout << "Iterations: " << iterations << std::endl;
+        std::cout << "CPU time: " << cpuMs << " ms" << std::endl;
 
-    std::vector<float> gpuOutput = runGpuJacobi(
-        initial,
-        n,
-        iterations,
-        gpuKernelMs,
-        gpuTotalMs
-    );
-    std::string ppmFilename = "results/heat_" + std::to_string(n) + ".ppm";
-    writePPM(gpuOutput, n, ppmFilename);
+        if (!ppmFilename.empty()) {
+            writePPM(cpuOutput, n, ppmFilename);
+            std::cout << "Wrote visualization to: " << ppmFilename << std::endl;
+        }
 
-    double error = maxAbsError(cpuOutput, gpuOutput);
-    bool passed = error < 1e-3;
+        return 0;
+    }
 
-    double updates = static_cast<double>(n - 2) * static_cast<double>(n - 2) * iterations;
-    double gpuSeconds = gpuKernelMs / 1000.0;
-    double estimatedGflops = (updates * 4.0) / (gpuSeconds * 1e9);
-    double estimatedBandwidth = (updates * 20.0) / (gpuSeconds * 1e9);
+    if (mode == "all") {
+        runAllVariants(initial, cpuOutput, cpuMs, n, iterations, ppmFilename, csvOutput);
+        return 0;
+    }
 
-    std::cout << std::fixed << std::setprecision(4);
+    GpuResult result;
+
+    if (mode == "global16") {
+        result = runGpuGlobal(initial, n, iterations, 16, 16, "global_16x16");
+    } else if (mode == "global32x8") {
+        result = runGpuGlobal(initial, n, iterations, 32, 8, "global_32x8");
+    } else if (mode == "shared16") {
+        result = runGpuShared(initial, n, iterations, 16, 16, "shared_16x16");
+    } else if (mode == "shared32x8") {
+        result = runGpuShared(initial, n, iterations, 32, 8, "shared_32x8");
+    } else {
+        std::cerr << "Unknown mode: " << mode << std::endl;
+        std::cerr << "Valid modes: all, cpu, global32x8, shared32x8" << std::endl;
+        return 1;
+    }
 
     std::cout << "Grid size: " << n << " x " << n << std::endl;
     std::cout << "Iterations: " << iterations << std::endl;
-    std::cout << "CPU time: " << cpuMs << " ms" << std::endl;
-    std::cout << "GPU kernel time: " << gpuKernelMs << " ms" << std::endl;
-    std::cout << "GPU total time: " << gpuTotalMs << " ms" << std::endl;
-    std::cout << "Max absolute error: " << error << std::endl;
-    std::cout << "Validation: " << (passed ? "PASS" : "FAIL") << std::endl;
-    std::cout << "GPU speedup using kernel time: " << cpuMs / gpuKernelMs << "x" << std::endl;
-    std::cout << "GPU speedup using total time: " << cpuMs / gpuTotalMs << "x" << std::endl;
-    std::cout << "Estimated GPU GFLOP/s: " << estimatedGflops << std::endl;
-    std::cout << "Estimated GPU bandwidth: " << estimatedBandwidth << " GB/s" << std::endl;
-    std::cout << "Wrote visualization to: " << ppmFilename << std::endl;
-    std::cout << "CSV,"
-              << n << ","
-              << iterations << ","
-              << cpuMs << ","
-              << gpuKernelMs << ","
-              << gpuTotalMs << ","
-              << error << ","
-              << cpuMs / gpuKernelMs << ","
-              << cpuMs / gpuTotalMs << ","
-              << estimatedGflops << ","
-              << estimatedBandwidth << ","
-              << (passed ? "PASS" : "FAIL")
-              << std::endl;
+    std::cout << std::endl;
 
-    return passed ? 0 : 1;
+    printGpuResult(result, cpuMs, cpuOutput, n, iterations);
+
+    if (!ppmFilename.empty()) {
+        writePPM(result.output, n, ppmFilename);
+        std::cout << "Wrote visualization to: " << ppmFilename << std::endl;
+    }
+
+    return 0;
 }
