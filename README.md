@@ -15,7 +15,8 @@ We will implement a 2D heat diffusion Jacobi stencil kernel in CUDA, validate ag
 ## to run the program
 make clean
 make
-./build/heat 256 5000
+make run
+./build/heat 2048 1000 all "" csv
 
 - CUDA
 - NVIDIA GPU server

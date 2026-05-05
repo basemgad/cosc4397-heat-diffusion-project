@@ -47,6 +47,65 @@ __global__ void jacobiGlobalKernel(const float* current, float* next, int n) {
     );
 }
 
+__forceinline__ __device__ float readCell(
+    const float* __restrict__ grid,
+    int n,
+    int row,
+    int col
+) {
+    if (row >= 0 && row < n && col >= 0 && col < n) {
+        return grid[row * n + col];
+    }
+
+    return 0.0f;
+}
+
+template <int BLOCK_X, int BLOCK_Y>
+__global__ void jacobiSharedTiledKernel(
+    const float* __restrict__ current,
+    float* __restrict__ next,
+    int n
+) {
+    __shared__ float tile[BLOCK_Y + 2][BLOCK_X + 2];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int col = blockIdx.x * BLOCK_X + tx + 1;
+    int row = blockIdx.y * BLOCK_Y + ty + 1;
+
+    tile[ty + 1][tx + 1] = readCell(current, n, row, col);
+
+    if (tx == 0) {
+        tile[ty + 1][0] = readCell(current, n, row, col - 1);
+    }
+
+    if (tx == BLOCK_X - 1) {
+        tile[ty + 1][BLOCK_X + 1] = readCell(current, n, row, col + 1);
+    }
+
+    if (ty == 0) {
+        tile[0][tx + 1] = readCell(current, n, row - 1, col);
+    }
+
+    if (ty == BLOCK_Y - 1) {
+        tile[BLOCK_Y + 1][tx + 1] = readCell(current, n, row + 1, col);
+    }
+
+    __syncthreads();
+
+    if (row >= n - 1 || col >= n - 1) {
+        return;
+    }
+
+    float top = tile[ty][tx + 1];
+    float bottom = tile[ty + 2][tx + 1];
+    float left = tile[ty + 1][tx];
+    float right = tile[ty + 1][tx + 2];
+
+    next[row * n + col] = 0.25f * (top + bottom + left + right);
+}
+
 __global__ void jacobiSharedKernel(const float* current, float* next, int n) {
     extern __shared__ float tile[];
 
@@ -64,11 +123,7 @@ __global__ void jacobiSharedKernel(const float* current, float* next, int n) {
             int globalRow = blockStartRow + sy;
             int globalCol = blockStartCol + sx;
 
-            if (globalRow >= 0 && globalRow < n && globalCol >= 0 && globalCol < n) {
-                tile[sy * sharedWidth + sx] = current[globalRow * n + globalCol];
-            } else {
-                tile[sy * sharedWidth + sx] = 0.0f;
-            }
+            tile[sy * sharedWidth + sx] = readCell(current, n, globalRow, globalCol);
         }
     }
 
@@ -229,7 +284,16 @@ GpuResult runGpuShared(
     CHECK_CUDA(cudaEventRecord(startEvent));
 
     for (int iter = 0; iter < iterations; ++iter) {
-        jacobiSharedKernel<<<grid, block, sharedBytes>>>(dCurrent, dNext, n);
+        if (blockX == 32 && blockY == 16) {
+            jacobiSharedTiledKernel<32, 16><<<grid, block>>>(dCurrent, dNext, n);
+        } else if (blockX == 16 && blockY == 16) {
+            jacobiSharedTiledKernel<16, 16><<<grid, block>>>(dCurrent, dNext, n);
+        } else if (blockX == 32 && blockY == 8) {
+            jacobiSharedTiledKernel<32, 8><<<grid, block>>>(dCurrent, dNext, n);
+        } else {
+            jacobiSharedKernel<<<grid, block, sharedBytes>>>(dCurrent, dNext, n);
+        }
+
         CHECK_CUDA(cudaGetLastError());
         std::swap(dCurrent, dNext);
     }
@@ -402,8 +466,8 @@ void runAllVariants(
 ) {
     std::vector<GpuResult> results;
 
-    results.push_back(runGpuGlobal(initial, n, iterations, 32, 8, "global_32x8"));
-    results.push_back(runGpuShared(initial, n, iterations, 32, 8, "shared_32x8"));
+    results.push_back(runGpuGlobal(initial, n, iterations, 32, 16, "global_32x16"));
+    results.push_back(runGpuShared(initial, n, iterations, 32, 16, "shared_32x16"));
 
     std::cout << std::fixed << std::setprecision(4);
 
@@ -479,8 +543,8 @@ int main(int argc, char** argv) {
     }
 
     if (argc >= 6) {
-    csvOutput = std::string(argv[5]) == "csv";
-}
+        csvOutput = std::string(argv[5]) == "csv";
+    }
 
     if (n < 3) {
         std::cerr << "Grid size must be at least 3." << std::endl;
@@ -527,13 +591,17 @@ int main(int argc, char** argv) {
         result = runGpuGlobal(initial, n, iterations, 16, 16, "global_16x16");
     } else if (mode == "global32x8") {
         result = runGpuGlobal(initial, n, iterations, 32, 8, "global_32x8");
+    } else if (mode == "global32x16") {
+        result = runGpuGlobal(initial, n, iterations, 32, 16, "global_32x16");
     } else if (mode == "shared16") {
         result = runGpuShared(initial, n, iterations, 16, 16, "shared_16x16");
     } else if (mode == "shared32x8") {
         result = runGpuShared(initial, n, iterations, 32, 8, "shared_32x8");
+    } else if (mode == "shared32x16") {
+        result = runGpuShared(initial, n, iterations, 32, 16, "shared_32x16");
     } else {
         std::cerr << "Unknown mode: " << mode << std::endl;
-        std::cerr << "Valid modes: all, cpu, global32x8, shared32x8" << std::endl;
+        std::cerr << "Valid modes: all, cpu, global16, global32x8, global32x16, shared16, shared32x8, shared32x16" << std::endl;
         return 1;
     }
 
@@ -550,3 +618,4 @@ int main(int argc, char** argv) {
 
     return 0;
 }
+

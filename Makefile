@@ -14,7 +14,7 @@ $(TARGET): $(SRC)
 
 run: all
 >@mkdir -p results
->@./$(TARGET) 256 5000 all results/heat_256.ppm
+>@./$(TARGET) 2048 1000 all results/heat_2048.ppm
 
 bench: all
 >@mkdir -p results
